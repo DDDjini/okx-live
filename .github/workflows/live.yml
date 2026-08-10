@@ -1,0 +1,24 @@
+name: OKX 实盘交易
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas numpy ccxt python-dotenv requests
+      - name: Run live trade
+        env:
+          FEISHU_LIVE_WEBHOOK: ${{ secrets.FEISHU_LIVE_WEBHOOK }}
+          OKX_LIVE_API_KEY: ${{ secrets.OKX_LIVE_API_KEY }}
+          OKX_LIVE_API_SECRET: ${{ secrets.OKX_LIVE_API_SECRET }}
+          OKX_LIVE_PASSPHRASE: ${{ secrets.OKX_LIVE_PASSPHRASE }}
+        run: python live_trader.py --once
