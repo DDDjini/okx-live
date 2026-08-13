@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import os
 import sys
+import time
 import requests
 import traceback
 from datetime import datetime, timezone
@@ -53,6 +54,7 @@ LEVERAGE = 100
 MARGIN_PCT = 0.03          # 头仓 3%
 ADD_MARGIN_PCT = 0.04      # 加仓 4%
 ADD_FRAC = 0.40            # 浮亏 40% 处加仓（入场到止损走完 2/5）
+ORDER_TTL_MS = 6 * 30 * 60 * 1000   # 限价挂单存活期：6根30mK线 = 3小时，超时未成交则撤单
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -267,15 +269,25 @@ class OKXTrader:
             return 0.0
 
     def fetch_open_orders(self, name):
-        """查询该币种未成交的普通限价挂单（非 algo）"""
+        """查询该币种未成交的普通限价挂单，返回 [{id, cTime(ms), price, side}]"""
         market = self.exchange.market(ASSETS[name]["symbol"])
         inst_id = market["id"]
+        result = []
         try:
             orders = self.exchange.fetch_open_orders(ASSETS[name]["symbol"])
-            return [o for o in orders if (o.get("info") or {}).get("instId") == inst_id]
+            for o in orders:
+                info = o.get("info") or {}
+                if info.get("instId") != inst_id:
+                    continue
+                result.append({
+                    "id": o.get("id"),
+                    "cTime": int(info.get("cTime", 0) or 0),  # 创建时间(毫秒)
+                    "price": o.get("price"),
+                    "side": o.get("side"),
+                })
         except Exception as e:
             print(f"  查询挂单失败 [{name}]: {e}")
-            return []
+        return result
 
     def cancel_open_orders(self, name):
         """撤销该币种所有未成交的普通限价挂单"""
@@ -593,6 +605,20 @@ def _run_inner(ts):
                 feishu(f"⚠️ [{name}] 加仓失败", f"**错误**: `{str(e)[:300]}`", color="red")
             continue
 
+        # 无持仓：先查挂单，判断是否超时（6根K线未成交才撤）
+        open_orders = trader.fetch_open_orders(name)
+        now_ms = int(time.time() * 1000)
+        if open_orders:
+            expired = [o for o in open_orders if now_ms - o["cTime"] > ORDER_TTL_MS]
+            if expired:
+                n_cancel = trader.cancel_open_orders(name)
+                print(f"  [{name}] 挂单超时(6根K线未成交)，撤销 {n_cancel} 个")
+            else:
+                age_min = (now_ms - open_orders[0]["cTime"]) / 60000
+                print(f"  [{name}] 已有挂单未成交(已挂{age_min:.0f}分钟)，保留等待成交")
+                continue
+
+        # 无挂单（或已撤销超时单）：拉数据 + 扫信号
         try:
             m30 = trader.fetch_ohlcv(name, "30m", 100)
             h1 = trader.fetch_ohlcv(name, "1h", 50)
@@ -605,32 +631,20 @@ def _run_inner(ts):
         print(f"  [{name}] 价格: {price:.2f}")
 
         sig = detect_signal(name, m30, h1, h4, cfg)
+        if not sig:
+            print(f"  [{name}] 无信号")
+            continue
 
-        # 查现有未成交挂单
-        open_orders = trader.fetch_open_orders(name)
-
-        if sig:
-            # 有信号：先撤旧挂单，再挂新限价单（每根K线重新评估）
-            if open_orders:
-                n_cancel = trader.cancel_open_orders(name)
-                print(f"  [{name}] 撤销旧挂单 {n_cancel} 个")
-            print(f"  🔔 [{name}] {sig['signal'].upper()} 限价挂单 @{sig['entry']}")
-            trader.set_leverage(name)
-            try:
-                contracts, margin = trader.open(name, sig["signal"], sig["entry"],
-                                                 sig["sl"], sig["tp"], equity)
-                signals_found.append(
-                    f"  {sig['signal'].upper()} 限价挂单@{sig['entry']} | {contracts}张 | 保证金{margin:.2f}"
-                )
-            except Exception as e:
-                feishu(f"⚠️ [{name}] 挂单失败", f"**信号**: {sig['signal'].upper()} @{sig['entry']}\n**错误**: `{str(e)[:300]}`", color="red")
-        else:
-            # 无信号：撤销遗留挂单（避免旧挂单一直挂着不成交）
-            if open_orders:
-                n_cancel = trader.cancel_open_orders(name)
-                print(f"  [{name}] 无信号，撤销旧挂单 {n_cancel} 个")
-            else:
-                print(f"  [{name}] 无信号")
+        print(f"  🔔 [{name}] {sig['signal'].upper()} 限价挂单 @{sig['entry']}")
+        trader.set_leverage(name)
+        try:
+            contracts, margin = trader.open(name, sig["signal"], sig["entry"],
+                                             sig["sl"], sig["tp"], equity)
+            signals_found.append(
+                f"  {sig['signal'].upper()} 限价挂单@{sig['entry']} | {contracts}张 | 保证金{margin:.2f}"
+            )
+        except Exception as e:
+            feishu(f"⚠️ [{name}] 挂单失败", f"**信号**: {sig['signal'].upper()} @{sig['entry']}\n**错误**: `{str(e)[:300]}`", color="red")
 
     sig_text = "\n".join(signals_found) if signals_found else "本轮无信号"
     action = "🎯 已下单！" if signals_found else "👀 等待信号"
