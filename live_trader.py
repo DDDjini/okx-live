@@ -207,12 +207,16 @@ class OKXTrader:
         market = self.exchange.market(sym)
         inst_id = market["id"]
 
+        # 限价单价格：严格用信号入场价（避免市价滑点）
+        px = self.exchange.price_to_precision(sym, entry_price)
+
         body = {
             "instId": inst_id,
             "tdMode": "cross",
             "side": order_side,
             "posSide": pos_side,
-            "ordType": "market",
+            "ordType": "limit",
+            "px": px,
             "sz": str(contracts),
             "attachAlgoOrds": [{
                 "tpTriggerPx": str(tp),
@@ -223,10 +227,10 @@ class OKXTrader:
                 "posSide": pos_side,
             }],
         }
-        print(f"  [{name}] 实盘下单: {order_side} {contracts}张 posSide={pos_side}")
+        print(f"  [{name}] 挂限价单: {order_side} {contracts}张 @{px} posSide={pos_side}")
         try:
             order = self.exchange.private_post_trade_order(body)
-            print(f"  [{name}] ✅ 开仓成功 {order}")
+            print(f"  [{name}] ✅ 限价挂单成功 {order}")
             return contracts, margin
         except Exception as e:
             print(f"  [{name}] 第1次下单失败: {e}")
@@ -234,10 +238,10 @@ class OKXTrader:
             del body2["posSide"]
             for ao in body2["attachAlgoOrds"]:
                 ao.pop("posSide", None)
-            print(f"  [{name}] 重试(无posSide): {order_side} {contracts}张")
+            print(f"  [{name}] 重试(无posSide): {order_side} {contracts}张 @{px}")
             try:
                 order = self.exchange.private_post_trade_order(body2)
-                print(f"  [{name}] ✅ 开仓成功 {order}")
+                print(f"  [{name}] ✅ 限价挂单成功 {order}")
                 return contracts, margin
             except Exception as e2:
                 print(f"  [{name}] ❌ 重试也失败: {e2}")
@@ -261,6 +265,40 @@ class OKXTrader:
         except Exception as e:
             print(f"  [{name}] 获取实时价失败: {e}")
             return 0.0
+
+    def fetch_open_orders(self, name):
+        """查询该币种未成交的普通限价挂单（非 algo）"""
+        market = self.exchange.market(ASSETS[name]["symbol"])
+        inst_id = market["id"]
+        try:
+            orders = self.exchange.fetch_open_orders(ASSETS[name]["symbol"])
+            return [o for o in orders if (o.get("info") or {}).get("instId") == inst_id]
+        except Exception as e:
+            print(f"  查询挂单失败 [{name}]: {e}")
+            return []
+
+    def cancel_open_orders(self, name):
+        """撤销该币种所有未成交的普通限价挂单"""
+        sym = ASSETS[name]["symbol"]
+        market = self.exchange.market(sym)
+        inst_id = market["id"]
+        cancelled = 0
+        try:
+            orders = self.exchange.fetch_open_orders(sym)
+            for o in orders:
+                if (o.get("info") or {}).get("instId") != inst_id:
+                    continue
+                oid = o.get("id")
+                if not oid:
+                    continue
+                try:
+                    self.exchange.cancel_order(oid, sym)
+                    cancelled += 1
+                except Exception as e:
+                    print(f"    撤单失败 {oid}: {e}")
+        except Exception as e:
+            print(f"  撤销挂单失败 [{name}]: {e}")
+        return cancelled
 
     def get_algo_prices(self, name):
         """读取该币种挂单的止损/止盈价，返回 (sl, tp, algo_sz)"""
@@ -567,20 +605,32 @@ def _run_inner(ts):
         print(f"  [{name}] 价格: {price:.2f}")
 
         sig = detect_signal(name, m30, h1, h4, cfg)
-        if not sig:
-            print(f"  [{name}] 无信号")
-            continue
 
-        print(f"  🔔 [{name}] {sig['signal'].upper()} @ {sig['entry']}")
-        trader.set_leverage(name)
-        try:
-            contracts, margin = trader.open(name, sig["signal"], sig["entry"],
-                                             sig["sl"], sig["tp"], equity)
-            signals_found.append(
-                f"  {sig['signal'].upper()} @{sig['entry']} | {contracts}张 | 保证金{margin:.2f}"
-            )
-        except Exception as e:
-            feishu(f"⚠️ [{name}] 下单失败", f"**信号**: {sig['signal'].upper()} @{sig['entry']}\n**错误**: `{str(e)[:300]}`", color="red")
+        # 查现有未成交挂单
+        open_orders = trader.fetch_open_orders(name)
+
+        if sig:
+            # 有信号：先撤旧挂单，再挂新限价单（每根K线重新评估）
+            if open_orders:
+                n_cancel = trader.cancel_open_orders(name)
+                print(f"  [{name}] 撤销旧挂单 {n_cancel} 个")
+            print(f"  🔔 [{name}] {sig['signal'].upper()} 限价挂单 @{sig['entry']}")
+            trader.set_leverage(name)
+            try:
+                contracts, margin = trader.open(name, sig["signal"], sig["entry"],
+                                                 sig["sl"], sig["tp"], equity)
+                signals_found.append(
+                    f"  {sig['signal'].upper()} 限价挂单@{sig['entry']} | {contracts}张 | 保证金{margin:.2f}"
+                )
+            except Exception as e:
+                feishu(f"⚠️ [{name}] 挂单失败", f"**信号**: {sig['signal'].upper()} @{sig['entry']}\n**错误**: `{str(e)[:300]}`", color="red")
+        else:
+            # 无信号：撤销遗留挂单（避免旧挂单一直挂着不成交）
+            if open_orders:
+                n_cancel = trader.cancel_open_orders(name)
+                print(f"  [{name}] 无信号，撤销旧挂单 {n_cancel} 个")
+            else:
+                print(f"  [{name}] 无信号")
 
     sig_text = "\n".join(signals_found) if signals_found else "本轮无信号"
     action = "🎯 已下单！" if signals_found else "👀 等待信号"
