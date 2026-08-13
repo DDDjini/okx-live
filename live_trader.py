@@ -7,6 +7,7 @@ OKX 实盘自动交易（GitHub Actions 私有库版）
 
 import ccxt
 import pandas as pd
+import numpy as np
 import os
 import sys
 import requests
@@ -14,8 +15,22 @@ import traceback
 from datetime import datetime, timezone
 
 # ═══════════════════════════════════════════════════════════════
-# 密钥（从环境变量读取 — 实盘专用）
+# 密钥（优先读环境变量，其次读 .env 文件）
 # ═══════════════════════════════════════════════════════════════
+
+# 尝试从 .env 文件加载
+env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(env_file):
+    with open(env_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ[k.strip()] = v.strip().strip('"').strip("'")
+    print(f"📄 已加载 .env 文件 ({env_file})")
+else:
+    print("⚠️ 未找到 .env 文件，将仅使用系统环境变量")
+    print(f"   .env 路径: {env_file}")
 
 API_KEY = os.getenv("OKX_LIVE_API_KEY", "")
 API_SECRET = os.getenv("OKX_LIVE_API_SECRET", "")
@@ -35,7 +50,9 @@ LEFT, RIGHT = 5, 2
 RR = 1.0
 SL_BUFFER = 0.0005
 LEVERAGE = 100
-MARGIN_PCT = 0.05          # 5%
+MARGIN_PCT = 0.03          # 头仓 3%
+ADD_MARGIN_PCT = 0.04      # 加仓 4%
+ADD_FRAC = 0.40            # 浮亏 40% 处加仓（入场到止损走完 2/5）
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -91,20 +108,33 @@ def add_fractals(df, left, right):
 
 class OKXTrader:
     def __init__(self):
-        if not all([API_KEY, API_SECRET, PASSPHRASE]):
-            raise RuntimeError("OKX API Key 未配置")
+        # 诊断：检查环境变量
+        missing = []
+        if not API_KEY: missing.append("OKX_LIVE_API_KEY")
+        if not API_SECRET: missing.append("OKX_LIVE_API_SECRET")
+        if not PASSPHRASE: missing.append("OKX_LIVE_PASSPHRASE")
+        if missing:
+            raise RuntimeError(f"缺少环境变量: {', '.join(missing)}")
+        if not FEISHU_WEBHOOK:
+            print("⚠️ FEISHU_LIVE_WEBHOOK 未设置，不会推送飞书")
+        print(f"🔑 密钥已加载: API_KEY={API_KEY[:8]}***")
 
         cfg = {
             "apiKey": API_KEY, "secret": API_SECRET, "password": PASSPHRASE,
             "enableRateLimit": True, "timeout": 30000,
             "options": {"defaultType": "swap"},
         }
+        # 本地需要代理才能连 OKX（有代理就用，没有就不加）
+        if os.getenv("OKX_PROXY"):
+            cfg["proxies"] = {"http": os.getenv("OKX_PROXY"), "https": os.getenv("OKX_PROXY")}
+            print("🌐 使用代理:", os.getenv("OKX_PROXY"))
         self.exchange = ccxt.okx(cfg)
-        # 注意：实盘不加 set_sandbox_mode
+        # 实盘不连 Sandbox
 
         for attempt in range(3):
             try:
                 self.exchange.load_markets()
+                print("✅ load_markets 成功")
                 break
             except Exception as e:
                 print(f"  load_markets 第{attempt+1}次失败: {e}")
@@ -222,18 +252,153 @@ class OKXTrader:
             df = df.iloc[:-1].reset_index(drop=True)
         return df
 
+    def fetch_price(self, name):
+        """获取最新实时价"""
+        sym = ASSETS[name]["symbol"]
+        try:
+            t = self.exchange.fetch_ticker(sym)
+            return float(t.get("last", 0) or 0)
+        except Exception as e:
+            print(f"  [{name}] 获取实时价失败: {e}")
+            return 0.0
+
+    def get_algo_prices(self, name):
+        """读取该币种挂单的止损/止盈价，返回 (sl, tp, algo_sz)"""
+        market = self.exchange.market(ASSETS[name]["symbol"])
+        inst_id = market["id"]
+        sl = tp = 0.0
+        algo_sz = 0.0
+        for ord_type in ["oco", "conditional", "move_order_stop"]:
+            try:
+                pending = self.exchange.private_get_trade_orders_algo_pending({
+                    "instId": inst_id, "ordType": ord_type,
+                })
+                data = pending.get("data", []) if isinstance(pending, dict) else []
+                for item in data:
+                    sl_v = float(item.get("slTriggerPx", 0) or 0)
+                    tp_v = float(item.get("tpTriggerPx", 0) or 0)
+                    sz_v = float(item.get("sz", 0) or 0)
+                    if sl_v > 0:
+                        sl = sl_v
+                    if tp_v > 0:
+                        tp = tp_v
+                    if sz_v > 0:
+                        algo_sz = max(algo_sz, sz_v)
+            except Exception:
+                pass
+        return sl, tp, algo_sz
+
+    def cancel_all_algos(self, name):
+        """撤销该币种所有止盈止损挂单"""
+        market = self.exchange.market(ASSETS[name]["symbol"])
+        inst_id = market["id"]
+        cancelled = 0
+        for ord_type in ["oco", "conditional", "move_order_stop"]:
+            try:
+                pending = self.exchange.private_get_trade_orders_algo_pending({
+                    "instId": inst_id, "ordType": ord_type,
+                })
+                data = pending.get("data", []) if isinstance(pending, dict) else []
+                for item in data:
+                    algo_id = item.get("algoId")
+                    if not algo_id:
+                        continue
+                    try:
+                        self.exchange.private_post_trade_cancel_algo({
+                            "instId": inst_id, "algoId": algo_id,
+                        })
+                        cancelled += 1
+                    except Exception as e:
+                        print(f"    撤销 algo {algo_id} 失败: {e}")
+            except Exception as e:
+                print(f"  查询 {ord_type} 挂单失败: {e}")
+        return cancelled
+
+    def add_to_position(self, name, signal, add_price, sl, new_tp, original_contracts, equity):
+        """加仓 4% + 重挂统一止盈止损（止损不变，止盈按平均成本重算）"""
+        sym = ASSETS[name]["symbol"]
+        ct_val = self.contracts[name]["ct_val"]
+        min_qty = self.contracts[name]["min_qty"]
+        pos_side = signal
+        order_side = "buy" if signal == "long" else "sell"
+
+        margin = equity * ADD_MARGIN_PCT
+        notional = margin * LEVERAGE
+        contracts = max(round(notional / (add_price * ct_val), 2), min_qty)
+
+        market = self.exchange.market(sym)
+        inst_id = market["id"]
+
+        body = {
+            "instId": inst_id, "tdMode": "cross", "side": order_side,
+            "posSide": pos_side, "ordType": "market", "sz": str(contracts),
+        }
+        print(f"  [{name}] 加仓: {order_side.upper()} {contracts}张 @{add_price:.2f}")
+        order = None
+        try:
+            order = self.exchange.private_post_trade_order(body)
+        except Exception as e:
+            print(f"  [{name}] 加仓失败(尝试无posSide): {e}")
+            body2 = dict(body)
+            del body2["posSide"]
+            order = self.exchange.private_post_trade_order(body2)
+
+        # 检查下单返回的 sCode（ccxt 不检查 code=0 但 sCode!=0 的情况）
+        if isinstance(order, dict):
+            data = order.get("data", [])
+            if data:
+                s_code = str(data[0].get("sCode", "0"))
+                if s_code != "0":
+                    raise RuntimeError(f"加仓下单被拒绝: sCode={s_code} {data[0].get('sMsg','')}")
+
+        # 验证加仓是否真的成交
+        import time
+        time.sleep(2)
+        pos_after = self.position(name)
+        after_contracts = float(pos_after["contracts"]) if pos_after else 0.0
+        if after_contracts <= original_contracts:
+            raise RuntimeError(f"加仓后仓位未增加: {original_contracts} -> {after_contracts} 张")
+        print(f"  [{name}] ✅ 加仓成功，持仓 {original_contracts} -> {after_contracts} 张")
+
+        # 撤销旧单，重挂统一止盈止损
+        self.cancel_all_algos(name)
+        close_side = "sell" if signal == "long" else "buy"
+        algo_body = {
+            "instId": inst_id, "tdMode": "cross", "side": close_side,
+            "posSide": pos_side, "ordType": "oco", "sz": str(after_contracts),
+            "tpTriggerPx": str(round(new_tp, 2)), "tpOrdPx": "-1",
+            "slTriggerPx": str(round(sl, 2)), "slOrdPx": "-1",
+        }
+        try:
+            self.exchange.private_post_trade_order_algo(algo_body)
+            print(f"  [{name}] ✅ 重挂统一止盈止损 SL={sl:.2f} TP={new_tp:.2f} ({after_contracts}张)")
+        except Exception as e:
+            print(f"  [{name}] ⚠️ 重挂止盈止损失败(需手动检查): {e}")
+
+        return contracts, margin, after_contracts
+
 
 # ═══════════════════════════════════════════════════════════════
 # 信号检测
 # ═══════════════════════════════════════════════════════════════
 
-def detect_signal(name, m30_df, h1_df, cfg):
+def detect_signal(name, m30_df, h1_df, h4_df, cfg):
     n = len(m30_df)
     if n < LEFT + RIGHT + 2:
         return None
 
     m30 = add_fractals(m30_df.copy(), LEFT, RIGHT)
     h1 = add_fractals(h1_df.copy(), 2, 2)
+
+    # 4h 分型事件（严格共振：最近一个分型方向必须匹配）
+    h4 = add_fractals(h4_df.copy(), 2, 2)
+    h4_mask = h4['fractal_low'].values | h4['fractal_high'].values
+    h4_ts = h4['timestamp'].values[h4_mask]
+    h4_typ = np.where(h4['fractal_low'].values[h4_mask], 'low', 'high')
+    if len(h4_ts) > 1:
+        order = np.argsort(h4_ts)
+        h4_ts = h4_ts[order]
+        h4_typ = h4_typ[order]
 
     for offset in range(0, 3):
         i = n - 1 - offset
@@ -256,6 +421,15 @@ def detect_signal(name, m30_df, h1_df, cfg):
         if dir_ == "long" and not sub["fractal_low"].any():
             continue
         if dir_ == "short" and not sub["fractal_high"].any():
+            continue
+
+        # 4h 严格共振（最近 4h 分型方向必须匹配）
+        idx4 = int(np.searchsorted(h4_ts, ts, side='right') - 1)
+        if idx4 < 0:
+            continue
+        if dir_ == "long" and h4_typ[idx4] != "low":
+            continue
+        if dir_ == "short" and h4_typ[idx4] != "high":
             continue
 
         entry = m30.loc[i, "close"]
@@ -327,12 +501,64 @@ def _run_inner(ts):
     for name, cfg in ASSETS.items():
         pos = trader.position(name)
         if pos:
-            print(f"  [{name}] 持仓中，跳过")
+            # ── 持仓中：判断是否需要加仓（浮亏40%处）──
+            side = pos["side"]
+            entry = pos["entry"]
+            contracts = pos["contracts"]
+            sl, tp, algo_sz = trader.get_algo_prices(name)
+
+            if sl <= 0:
+                print(f"  [{name}] 持仓中但无止损单，跳过加仓")
+                continue
+
+            # 头仓应有张数（3%保证金×100x）
+            ct_val = trader.contracts[name]["ct_val"]
+            expected_head = equity * MARGIN_PCT * LEVERAGE / (entry * ct_val) if entry > 0 else 0
+
+            # 判断是否已加仓：挂单张数 > 1.5倍头仓
+            ref_sz = algo_sz if algo_sz > 0 else contracts
+            if ref_sz > expected_head * 1.5:
+                print(f"  [{name}] 已加仓({contracts}张)，跳过")
+                continue
+
+            # 未加仓，计算加仓触发价（浮亏40%）
+            if side == "long":
+                add_price = entry - ADD_FRAC * (entry - sl)
+            else:
+                add_price = entry + ADD_FRAC * (sl - entry)
+
+            price = trader.fetch_price(name)
+            trigger = (side == "long" and price > 0 and price <= add_price) or \
+                      (side == "short" and price > 0 and price >= add_price)
+
+            if not trigger:
+                print(f"  [{name}] 持仓中，价格{price:.2f}未到加仓区(触发价{add_price:.2f})")
+                continue
+
+            # 触发加仓
+            print(f"  🔔 [{name}] 触及加仓区{add_price:.2f}，执行加仓!")
+            avg_entry = (entry + add_price) / 2
+            if side == "long":
+                new_risk = avg_entry - sl
+                new_tp = avg_entry + RR * new_risk
+            else:
+                new_risk = sl - avg_entry
+                new_tp = avg_entry - RR * new_risk
+
+            try:
+                add_contracts, add_margin, total = trader.add_to_position(
+                    name, side, add_price, sl, new_tp, contracts, equity)
+                signals_found.append(
+                    f"  📈 {side.upper()}加仓 @{add_price:.2f} | +{add_contracts}张 | 总{total}张"
+                )
+            except Exception as e:
+                feishu(f"⚠️ [{name}] 加仓失败", f"**错误**: `{str(e)[:300]}`", color="red")
             continue
 
         try:
             m30 = trader.fetch_ohlcv(name, "30m", 100)
             h1 = trader.fetch_ohlcv(name, "1h", 50)
+            h4 = trader.fetch_ohlcv(name, "4h", 100)
         except Exception as e:
             print(f"  [{name}] 数据拉取失败: {e}")
             continue
@@ -340,7 +566,7 @@ def _run_inner(ts):
         price = m30["close"].iloc[-1]
         print(f"  [{name}] 价格: {price:.2f}")
 
-        sig = detect_signal(name, m30, h1, cfg)
+        sig = detect_signal(name, m30, h1, h4, cfg)
         if not sig:
             print(f"  [{name}] 无信号")
             continue
