@@ -52,7 +52,7 @@ RR = 1.0
 SL_BUFFER = 0.0005
 LEVERAGE = 100
 MARGIN_PCT = 0.03          # 头仓 3%
-ADD_MARGIN_PCT = 0.04      # 加仓 4%
+ADD_MARGIN_PCT = 0.02      # 加仓 2%
 ADD_FRAC = 0.40            # 浮亏 40% 处加仓（入场到止损走完 2/5）
 ORDER_TTL_MS = 6 * 30 * 60 * 1000   # 限价挂单存活期：6根30mK线 = 3小时，超时未成交则撤单
 
@@ -365,7 +365,7 @@ class OKXTrader:
         return cancelled
 
     def add_to_position(self, name, signal, add_price, sl, new_tp, original_contracts, equity):
-        """加仓 4% + 重挂统一止盈止损（止损不变，止盈按平均成本重算）"""
+        """加仓 2% + 重挂统一止盈止损（止损不变，止盈按平均成本重算）"""
         sym = ASSETS[name]["symbol"]
         ct_val = self.contracts[name]["ct_val"]
         min_qty = self.contracts[name]["min_qty"]
@@ -565,9 +565,9 @@ def _run_inner(ts):
             ct_val = trader.contracts[name]["ct_val"]
             expected_head = equity * MARGIN_PCT * LEVERAGE / (entry * ct_val) if entry > 0 else 0
 
-            # 判断是否已加仓：挂单张数 > 1.5倍头仓
+            # 判断是否已加仓：挂单张数 > 1.3倍头仓（加仓2%后总张数≈1.67倍头仓）
             ref_sz = algo_sz if algo_sz > 0 else contracts
-            if ref_sz > expected_head * 1.5:
+            if ref_sz > expected_head * 1.3:
                 print(f"  [{name}] 已加仓({contracts}张)，跳过")
                 continue
 
