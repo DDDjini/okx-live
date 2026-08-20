@@ -51,8 +51,8 @@ LEFT, RIGHT = 5, 2
 RR = 1.5
 SL_BUFFER = 0.0005
 LEVERAGE = 100
-MARGIN_PCT = 0.03          # 头仓 3%
-ADD_MARGIN_PCT = 0.04      # 加仓 4%
+MARGIN_PCT = 0.05          # 头仓 5%
+ADD_MARGIN_PCT = 0.03      # 加仓 3%
 ADD_FRAC = 0.60            # 浮亏 60% 处加仓（入场到止损走完 3/5）
 ORDER_TTL_MS = 6 * 30 * 60 * 1000   # 限价挂单存活期：6根30mK线 = 3小时，超时未成交则撤单
 
@@ -373,7 +373,7 @@ class OKXTrader:
         return cancelled
 
     def add_to_position(self, name, signal, add_price, sl, new_tp, original_contracts, equity):
-        """加仓 4% + 重挂统一止盈止损（止损不变，止盈按平均成本重算）"""
+        """加仓 3% + 重挂统一止盈止损（止损不变，止盈按平均成本重算）"""
         sym = ASSETS[name]["symbol"]
         ct_val = self.contracts[name]["ct_val"]
         min_qty = self.contracts[name]["min_qty"]
@@ -593,7 +593,7 @@ def _run_inner(ts):
     for name, cfg in ASSETS.items():
         pos = trader.position(name)
         if pos:
-            # ── 持仓中：判断是否需要加仓（浮亏40%处）──
+            # ── 持仓中：判断是否需要加仓（浮亏60%处）──
             side = pos["side"]
             entry = pos["entry"]
             contracts = pos["contracts"]
@@ -603,17 +603,17 @@ def _run_inner(ts):
                 print(f"  [{name}] 持仓中但无止损单，跳过加仓")
                 continue
 
-            # 头仓应有张数（3%保证金×100x）
+            # 头仓应有张数（5%保证金×100x）
             ct_val = trader.contracts[name]["ct_val"]
             expected_head = equity * MARGIN_PCT * LEVERAGE / (entry * ct_val) if entry > 0 else 0
 
-            # 判断是否已加仓：挂单张数 > 1.3倍头仓（加仓4%后总张数≈2.33倍头仓）
+            # 判断是否已加仓：挂单张数 > 1.25倍头仓（加仓3%后总张数≈1.6倍头仓）
             ref_sz = algo_sz if algo_sz > 0 else contracts
-            if ref_sz > expected_head * 1.3:
+            if ref_sz > expected_head * 1.25:
                 print(f"  [{name}] 已加仓({contracts}张)，跳过")
                 continue
 
-            # 未加仓，计算加仓触发价（浮亏40%）
+            # 未加仓，计算加仓触发价（浮亏60%）
             if side == "long":
                 add_price = entry - ADD_FRAC * (entry - sl)
             else:
