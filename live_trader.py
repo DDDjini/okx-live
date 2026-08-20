@@ -59,7 +59,7 @@ ORDER_TTL_MS = 6 * 30 * 60 * 1000   # 限价挂单存活期：6根30mK线 = 3小
 # ── 回测定稿新增参数 ──
 OFFSET_RANGE = 1           # 分型扫描根数（只扫最新一根）
 RISK_FILTER_PCT = 0.6      # 风险过滤：止损距离占价格比例 >= 0.6% 则过滤该信号
-H1_STRICT = True           # 1h 严格判定：最近 1h 分型方向须与信号一致
+H1_STRICT = False          # 1h 宽松判定：仅要求 1h 存在同向分型（回测定稿：宽松优化）
 H4_CONFIRMED = True        # 4h 仅用右肩收盘(右2根已收盘)确认分型，忽略未成型临时分型
 
 
@@ -447,7 +447,7 @@ def detect_signal(name, m30_df, h1_df, h4_df, cfg):
     h1 = add_fractals(h1_df.copy(), 2, 2)
     h4 = add_fractals(h4_df.copy(), 2, 2)
 
-    # 1h 分型事件（严格判定：最近一个分型方向必须匹配）
+    # 1h 分型事件（宽松：存在同向分型即可；严格：最近分型方向必须匹配）
     if H1_STRICT:
         h1_mask = h1['fractal_low'].values | h1['fractal_high'].values
         h1_ts = h1['timestamp'].values[h1_mask]
