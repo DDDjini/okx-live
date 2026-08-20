@@ -48,13 +48,19 @@ ASSETS = {
 }
 
 LEFT, RIGHT = 5, 2
-RR = 1.0
+RR = 1.5
 SL_BUFFER = 0.0005
 LEVERAGE = 100
 MARGIN_PCT = 0.03          # 头仓 3%
-ADD_MARGIN_PCT = 0.02      # 加仓 2%
-ADD_FRAC = 0.40            # 浮亏 40% 处加仓（入场到止损走完 2/5）
+ADD_MARGIN_PCT = 0.04      # 加仓 4%
+ADD_FRAC = 0.60            # 浮亏 60% 处加仓（入场到止损走完 3/5）
 ORDER_TTL_MS = 6 * 30 * 60 * 1000   # 限价挂单存活期：6根30mK线 = 3小时，超时未成交则撤单
+
+# ── 回测定稿新增参数 ──
+OFFSET_RANGE = 1           # 分型扫描根数（只扫最新一根）
+RISK_FILTER_PCT = 0.6      # 风险过滤：止损距离占价格比例 >= 0.6% 则过滤该信号
+H1_STRICT = True           # 1h 严格判定：最近 1h 分型方向须与信号一致
+H4_CONFIRMED = True        # 4h 仅用右肩收盘(右2根已收盘)确认分型，忽略未成型临时分型
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -365,7 +371,7 @@ class OKXTrader:
         return cancelled
 
     def add_to_position(self, name, signal, add_price, sl, new_tp, original_contracts, equity):
-        """加仓 2% + 重挂统一止盈止损（止损不变，止盈按平均成本重算）"""
+        """加仓 4% + 重挂统一止盈止损（止损不变，止盈按平均成本重算）"""
         sym = ASSETS[name]["symbol"]
         ct_val = self.contracts[name]["ct_val"]
         min_qty = self.contracts[name]["min_qty"]
@@ -439,10 +445,25 @@ def detect_signal(name, m30_df, h1_df, h4_df, cfg):
 
     m30 = add_fractals(m30_df.copy(), LEFT, RIGHT)
     h1 = add_fractals(h1_df.copy(), 2, 2)
-
-    # 4h 分型事件（严格共振：最近一个分型方向必须匹配）
     h4 = add_fractals(h4_df.copy(), 2, 2)
+
+    # 1h 分型事件（严格判定：最近一个分型方向必须匹配）
+    if H1_STRICT:
+        h1_mask = h1['fractal_low'].values | h1['fractal_high'].values
+        h1_ts = h1['timestamp'].values[h1_mask]
+        h1_typ = np.where(h1['fractal_low'].values[h1_mask], 'low', 'high')
+        if len(h1_ts) > 1:
+            order = np.argsort(h1_ts)
+            h1_ts = h1_ts[order]
+            h1_typ = h1_typ[order]
+
+    # 4h 分型事件（严格共振：最近一个"已确认"分型方向必须匹配）
     h4_mask = h4['fractal_low'].values | h4['fractal_high'].values
+    if H4_CONFIRMED:
+        # 仅保留右肩收盘确认的分型（右 2 根必须已收盘，末尾 right=2 根分型视为未成型）
+        n4 = len(h4_df)
+        confirmed_ok = np.arange(n4) <= (n4 - 1 - 2)
+        h4_mask = h4_mask & confirmed_ok
     h4_ts = h4['timestamp'].values[h4_mask]
     h4_typ = np.where(h4['fractal_low'].values[h4_mask], 'low', 'high')
     if len(h4_ts) > 1:
@@ -450,7 +471,7 @@ def detect_signal(name, m30_df, h1_df, h4_df, cfg):
         h4_ts = h4_ts[order]
         h4_typ = h4_typ[order]
 
-    for offset in range(0, 3):
+    for offset in range(0, OFFSET_RANGE):
         i = n - 1 - offset
         pivot = i - RIGHT
         if pivot < 0:
@@ -468,12 +489,21 @@ def detect_signal(name, m30_df, h1_df, h4_df, cfg):
         sub = h1[h1["timestamp"] <= ts]
         if len(sub) < 5:
             continue
-        if dir_ == "long" and not sub["fractal_low"].any():
-            continue
-        if dir_ == "short" and not sub["fractal_high"].any():
-            continue
+        if H1_STRICT:
+            idx1 = int(np.searchsorted(h1_ts, ts, side='right') - 1)
+            if idx1 < 0:
+                continue
+            if dir_ == "long" and h1_typ[idx1] != "low":
+                continue
+            if dir_ == "short" and h1_typ[idx1] != "high":
+                continue
+        else:
+            if dir_ == "long" and not sub["fractal_low"].any():
+                continue
+            if dir_ == "short" and not sub["fractal_high"].any():
+                continue
 
-        # 4h 严格共振（最近 4h 分型方向必须匹配）
+        # 4h 严格共振（最近 4h 已确认分型方向必须匹配）
         idx4 = int(np.searchsorted(h4_ts, ts, side='right') - 1)
         if idx4 < 0:
             continue
@@ -505,6 +535,11 @@ def detect_signal(name, m30_df, h1_df, h4_df, cfg):
             if max_pts and risk > max_pts:
                 risk = max_pts; sl = entry + risk
             tp = entry - RR * risk
+
+        # 风险过滤：止损距离占价格比例 >= RISK_FILTER_PCT% 则跳过该信号
+        risk_pct = abs(entry - sl) / entry * 100
+        if risk_pct >= RISK_FILTER_PCT:
+            continue
 
         return {
             "asset": name, "signal": dir_,
@@ -565,7 +600,7 @@ def _run_inner(ts):
             ct_val = trader.contracts[name]["ct_val"]
             expected_head = equity * MARGIN_PCT * LEVERAGE / (entry * ct_val) if entry > 0 else 0
 
-            # 判断是否已加仓：挂单张数 > 1.3倍头仓（加仓2%后总张数≈1.67倍头仓）
+            # 判断是否已加仓：挂单张数 > 1.3倍头仓（加仓4%后总张数≈2.33倍头仓）
             ref_sz = algo_sz if algo_sz > 0 else contracts
             if ref_sz > expected_head * 1.3:
                 print(f"  [{name}] 已加仓({contracts}张)，跳过")
