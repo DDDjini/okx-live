@@ -59,8 +59,10 @@ ORDER_TTL_MS = 6 * 30 * 60 * 1000   # 限价挂单存活期：6根30mK线 = 3小
 # ── 回测定稿新增参数 ──
 OFFSET_RANGE = 1           # 分型扫描根数（只扫最新一根）
 RISK_FILTER_PCT = 0.6      # 风险过滤：止损距离占价格比例 >= 0.6% 则过滤该信号
-H1_STRICT = False          # 1h 宽松判定：仅要求 1h 存在同向分型（回测定稿：宽松优化）
-H4_CONFIRMED = True        # 4h 仅用右肩收盘(右2根已收盘)确认分型，忽略未成型临时分型
+H1_ENABLED = False         # 关闭 1h 分型过滤（回测定稿：1h 关闭）
+H4_ENABLED = False         # 关闭 4h 分型过滤（多方对比确认无用）
+H1_STRICT = False          # 1h 宽松判定（H1_ENABLED=False 后此参数无效）
+H4_CONFIRMED = False       # 4h 右肩收盘确认（H4_ENABLED=False 后此参数无效）
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -448,28 +450,30 @@ def detect_signal(name, m30_df, h1_df, h4_df, cfg):
     h4 = add_fractals(h4_df.copy(), 2, 2)
 
     # 1h 分型事件（宽松：存在同向分型即可；严格：最近分型方向必须匹配）
-    if H1_STRICT:
-        h1_mask = h1['fractal_low'].values | h1['fractal_high'].values
-        h1_ts = h1['timestamp'].values[h1_mask]
-        h1_typ = np.where(h1['fractal_low'].values[h1_mask], 'low', 'high')
-        if len(h1_ts) > 1:
-            order = np.argsort(h1_ts)
-            h1_ts = h1_ts[order]
-            h1_typ = h1_typ[order]
+    if H1_ENABLED:
+        if H1_STRICT:
+            h1_mask = h1['fractal_low'].values | h1['fractal_high'].values
+            h1_ts = h1['timestamp'].values[h1_mask]
+            h1_typ = np.where(h1['fractal_low'].values[h1_mask], 'low', 'high')
+            if len(h1_ts) > 1:
+                order = np.argsort(h1_ts)
+                h1_ts = h1_ts[order]
+                h1_typ = h1_typ[order]
 
     # 4h 分型事件（严格共振：最近一个"已确认"分型方向必须匹配）
-    h4_mask = h4['fractal_low'].values | h4['fractal_high'].values
-    if H4_CONFIRMED:
-        # 仅保留右肩收盘确认的分型（右 2 根必须已收盘，末尾 right=2 根分型视为未成型）
-        n4 = len(h4_df)
-        confirmed_ok = np.arange(n4) <= (n4 - 1 - 2)
-        h4_mask = h4_mask & confirmed_ok
-    h4_ts = h4['timestamp'].values[h4_mask]
-    h4_typ = np.where(h4['fractal_low'].values[h4_mask], 'low', 'high')
-    if len(h4_ts) > 1:
-        order = np.argsort(h4_ts)
-        h4_ts = h4_ts[order]
-        h4_typ = h4_typ[order]
+    if H4_ENABLED:
+        h4_mask = h4['fractal_low'].values | h4['fractal_high'].values
+        if H4_CONFIRMED:
+            # 仅保留右肩收盘确认的分型（右 2 根必须已收盘，末尾 right=2 根分型视为未成型）
+            n4 = len(h4_df)
+            confirmed_ok = np.arange(n4) <= (n4 - 1 - 2)
+            h4_mask = h4_mask & confirmed_ok
+        h4_ts = h4['timestamp'].values[h4_mask]
+        h4_typ = np.where(h4['fractal_low'].values[h4_mask], 'low', 'high')
+        if len(h4_ts) > 1:
+            order = np.argsort(h4_ts)
+            h4_ts = h4_ts[order]
+            h4_typ = h4_typ[order]
 
     for offset in range(0, OFFSET_RANGE):
         i = n - 1 - offset
@@ -486,31 +490,34 @@ def detect_signal(name, m30_df, h1_df, h4_df, cfg):
             continue
 
         ts = m30.loc[pivot, "timestamp"]
-        sub = h1[h1["timestamp"] <= ts]
-        if len(sub) < 5:
-            continue
-        if H1_STRICT:
-            idx1 = int(np.searchsorted(h1_ts, ts, side='right') - 1)
-            if idx1 < 0:
+
+        if H1_ENABLED:
+            sub = h1[h1["timestamp"] <= ts]
+            if len(sub) < 5:
                 continue
-            if dir_ == "long" and h1_typ[idx1] != "low":
-                continue
-            if dir_ == "short" and h1_typ[idx1] != "high":
-                continue
-        else:
-            if dir_ == "long" and not sub["fractal_low"].any():
-                continue
-            if dir_ == "short" and not sub["fractal_high"].any():
-                continue
+            if H1_STRICT:
+                idx1 = int(np.searchsorted(h1_ts, ts, side='right') - 1)
+                if idx1 < 0:
+                    continue
+                if dir_ == "long" and h1_typ[idx1] != "low":
+                    continue
+                if dir_ == "short" and h1_typ[idx1] != "high":
+                    continue
+            else:
+                if dir_ == "long" and not sub["fractal_low"].any():
+                    continue
+                if dir_ == "short" and not sub["fractal_high"].any():
+                    continue
 
         # 4h 严格共振（最近 4h 已确认分型方向必须匹配）
-        idx4 = int(np.searchsorted(h4_ts, ts, side='right') - 1)
-        if idx4 < 0:
-            continue
-        if dir_ == "long" and h4_typ[idx4] != "low":
-            continue
-        if dir_ == "short" and h4_typ[idx4] != "high":
-            continue
+        if H4_ENABLED:
+            idx4 = int(np.searchsorted(h4_ts, ts, side='right') - 1)
+            if idx4 < 0:
+                continue
+            if dir_ == "long" and h4_typ[idx4] != "low":
+                continue
+            if dir_ == "short" and h4_typ[idx4] != "high":
+                continue
 
         entry = m30.loc[i, "close"]
         if dir_ == "long":
