@@ -180,7 +180,14 @@ class OKXTrader:
         try:
             positions = self.exchange.fetch_positions([sym])
             for p in positions:
-                if p.get("symbol") == sym and abs(float(p.get("contracts", 0))) > 0:
+                if p.get("symbol") != sym:
+                    continue
+                # 只看逐仓(isolated)仓位，全仓(cross)仓位一律忽略
+                mmode = ((p.get("marginMode") or "").lower()
+                         or (p.get("info") or {}).get("mgnMode", "").lower())
+                if mmode != "isolated":
+                    continue
+                if abs(float(p.get("contracts", 0))) > 0:
                     side = p.get("posSide", p.get("side", "long"))
                     return {
                         "side": side, "contracts": float(p["contracts"]),
@@ -191,14 +198,16 @@ class OKXTrader:
             print(f"  持仓查询失败 [{name}]: {e}")
             return None
 
-    def set_leverage(self, name):
+    def set_leverage(self, name, pos_side=None):
         sym = ASSETS[name]["symbol"]
         market_data = self.exchange.market(sym)
         inst_id = market_data["id"]
         try:
-            self.exchange.set_leverage(LEVERAGE, sym,
-                                       params={"instId": inst_id, "lever": str(LEVERAGE), "mgnMode": "cross"})
-            print(f"  [{name}] 杠杆: {LEVERAGE}x")
+            params = {"instId": inst_id, "lever": str(LEVERAGE), "mgnMode": "isolated"}
+            if pos_side in ("long", "short"):
+                params["posSide"] = pos_side
+            self.exchange.set_leverage(LEVERAGE, sym, params=params)
+            print(f"  [{name}] 杠杆: {LEVERAGE}x (逐仓)")
         except Exception as e:
             print(f"  [{name}] 杠杆设置失败: {e}")
 
@@ -222,7 +231,7 @@ class OKXTrader:
 
         body = {
             "instId": inst_id,
-            "tdMode": "cross",
+            "tdMode": "isolated",
             "side": order_side,
             "posSide": pos_side,
             "ordType": "limit",
@@ -287,6 +296,9 @@ class OKXTrader:
                 info = o.get("info") or {}
                 if info.get("instId") != inst_id:
                     continue
+                tm = (info.get("tdMode") or "").lower()
+                if tm and tm != "isolated":
+                    continue  # 只认逐仓挂单，忽略全仓
                 result.append({
                     "id": o.get("id"),
                     "cTime": int(info.get("cTime", 0) or 0),  # 创建时间(毫秒)
@@ -306,8 +318,12 @@ class OKXTrader:
         try:
             orders = self.exchange.fetch_open_orders(sym)
             for o in orders:
-                if (o.get("info") or {}).get("instId") != inst_id:
+                info = o.get("info") or {}
+                if info.get("instId") != inst_id:
                     continue
+                tm = (info.get("tdMode") or "").lower()
+                if tm and tm != "isolated":
+                    continue  # 只撤逐仓挂单，忽略全仓
                 oid = o.get("id")
                 if not oid:
                     continue
@@ -333,6 +349,8 @@ class OKXTrader:
                 })
                 data = pending.get("data", []) if isinstance(pending, dict) else []
                 for item in data:
+                    if (item.get("tdMode") or "").lower() != "isolated":
+                        continue  # 只认逐仓算法单
                     sl_v = float(item.get("slTriggerPx", 0) or 0)
                     tp_v = float(item.get("tpTriggerPx", 0) or 0)
                     sz_v = float(item.get("sz", 0) or 0)
@@ -358,6 +376,8 @@ class OKXTrader:
                 })
                 data = pending.get("data", []) if isinstance(pending, dict) else []
                 for item in data:
+                    if (item.get("tdMode") or "").lower() != "isolated":
+                        continue  # 只撤逐仓算法单
                     algo_id = item.get("algoId")
                     if not algo_id:
                         continue
@@ -388,7 +408,7 @@ class OKXTrader:
         inst_id = market["id"]
 
         body = {
-            "instId": inst_id, "tdMode": "cross", "side": order_side,
+            "instId": inst_id, "tdMode": "isolated", "side": order_side,
             "posSide": pos_side, "ordType": "market", "sz": str(contracts),
         }
         print(f"  [{name}] 加仓: {order_side.upper()} {contracts}张 @{add_price:.2f}")
@@ -422,7 +442,7 @@ class OKXTrader:
         self.cancel_all_algos(name)
         close_side = "sell" if signal == "long" else "buy"
         algo_body = {
-            "instId": inst_id, "tdMode": "cross", "side": close_side,
+            "instId": inst_id, "tdMode": "isolated", "side": close_side,
             "posSide": pos_side, "ordType": "oco", "sz": str(after_contracts),
             "tpTriggerPx": str(round(new_tp, 2)), "tpOrdPx": "-1",
             "slTriggerPx": str(round(sl, 2)), "slOrdPx": "-1",
@@ -678,7 +698,7 @@ def _run_inner(ts):
             continue
 
         print(f"  🔔 [{name}] {sig['signal'].upper()} 限价挂单 @{sig['entry']}")
-        trader.set_leverage(name)
+        trader.set_leverage(name, sig["signal"])
         try:
             contracts, margin = trader.open(name, sig["signal"], sig["entry"],
                                              sig["sl"], sig["tp"], equity)
@@ -714,3 +734,4 @@ if __name__ == "__main__":
         run_once()
     else:
         print("用法: python live_trader.py --once")
+
