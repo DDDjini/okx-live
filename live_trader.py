@@ -52,8 +52,9 @@ RR = 1.5
 SL_BUFFER = 0.0005
 LEVERAGE = 100
 MARGIN_PCT = 0.05          # 头仓 5%
-ADD_MARGIN_PCT = 0.03      # 加仓 3%
-ADD_FRAC = 0.60            # 浮亏 60% 处加仓（入场到止损走完 3/5）
+ADD_ENABLED = False        # 关闭加仓（浮盈加仓风险；回测结论：加仓放大亏损、降低盈亏比）
+ADD_MARGIN_PCT = 0.03      # 加仓 3%（ADD_ENABLED=False 后不生效）
+ADD_FRAC = 0.60            # 浮亏 60% 处加仓（ADD_ENABLED=False 后不生效）
 ORDER_TTL_MS = 6 * 30 * 60 * 1000   # 限价挂单存活期：6根30mK线 = 3小时，超时未成交则撤单
 
 # ── 回测定稿新增参数 ──
@@ -613,6 +614,9 @@ def _run_inner(ts):
     for name, cfg in ASSETS.items():
         pos = trader.position(name)
         if pos:
+            if not ADD_ENABLED:
+                print(f"  [{name}] 持仓 {pos['side']} {pos['contracts']}张 @{pos['entry']}（加仓已关闭，跳过）")
+                continue
             # ── 持仓中：判断是否需要加仓（浮亏60%处）──
             side = pos["side"]
             entry = pos["entry"]
