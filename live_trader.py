@@ -50,8 +50,8 @@ ASSETS = {
 LEFT, RIGHT = 5, 2
 RR = 1.5
 SL_BUFFER = 0.0005
-LEVERAGE = 100
-MARGIN_PCT = 0.05          # 头仓 5%
+LEVERAGE = 25              # 25x 杠杆（逐仓）
+MARGIN_PCT = 0.25          # 头仓 25% 账户权益 → 名义仓位 = 6.25x 权益
 ADD_ENABLED = False        # 关闭加仓（浮盈加仓风险；回测结论：加仓放大亏损、降低盈亏比）
 ADD_MARGIN_PCT = 0.03      # 加仓 3%（ADD_ENABLED=False 后不生效）
 ADD_FRAC = 0.60            # 浮亏 60% 处加仓（ADD_ENABLED=False 后不生效）
@@ -627,7 +627,7 @@ def _run_inner(ts):
                 print(f"  [{name}] 持仓中但无止损单，跳过加仓")
                 continue
 
-            # 头仓应有张数（5%保证金×100x）
+            # 头仓应有张数（25%保证金×25x）
             ct_val = trader.contracts[name]["ct_val"]
             expected_head = equity * MARGIN_PCT * LEVERAGE / (entry * ct_val) if entry > 0 else 0
 
