@@ -13,6 +13,8 @@ import sys
 import time
 import requests
 import traceback
+import hashlib
+import math
 from datetime import datetime, timezone
 
 # ═══════════════════════════════════════════════════════════════
@@ -27,7 +29,7 @@ if os.path.exists(env_file):
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
-                os.environ[k.strip()] = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     print(f"📄 已加载 .env 文件 ({env_file})")
 else:
     print("⚠️ 未找到 .env 文件，将仅使用系统环境变量")
@@ -51,7 +53,10 @@ LEFT, RIGHT = 5, 2
 RR = 1.5
 SL_BUFFER = 0.0005
 LEVERAGE = 25              # 25x 杠杆（逐仓）
-MARGIN_PCT = 0.25          # 头仓 25% 账户权益 → 名义仓位 = 6.25x 权益
+MARGIN_PCT = 0.05          # conservative cap; review before activation
+RISK_PCT = 0.005           # planned loss cap on available USDT, before funding/gaps
+COST_BUFFER = 0.0015       # assumed fee + slippage buffer; validate before activation
+ORDER_PREFIX = "F30V2"
 ADD_ENABLED = False        # 关闭加仓（浮盈加仓风险；回测结论：加仓放大亏损、降低盈亏比）
 ADD_MARGIN_PCT = 0.03      # 加仓 3%（ADD_ENABLED=False 后不生效）
 ADD_FRAC = 0.60            # 浮亏 60% 处加仓（ADD_ENABLED=False 后不生效）
@@ -100,16 +105,16 @@ def feishu(title: str, content: str, color: str = "blue"):
 
 def add_fractals(df, left, right):
     df = df.copy()
-    low_shifts = [df["low"].shift(k) for k in range(-left, right + 1)]
-    high_shifts = [df["high"].shift(k) for k in range(-left, right + 1)]
+    low_shifts = [df["low"].shift(k) for k in range(-right, left + 1)]
+    high_shifts = [df["high"].shift(k) for k in range(-right, left + 1)]
     lm = pd.concat(low_shifts, axis=1)
     hm = pd.concat(high_shifts, axis=1)
     min_low = lm.min(axis=1)
     max_high = hm.max(axis=1)
     count_low = (lm.values == df["low"].values[:, None]).sum(axis=1)
     count_high = (hm.values == df["high"].values[:, None]).sum(axis=1)
-    df["fractal_low"] = (df["low"] == min_low) & (count_low == 1)
-    df["fractal_high"] = (df["high"] == max_high) & (count_high == 1)
+    df["fractal_low"] = lm.notna().all(axis=1) & (df["low"] == min_low) & (count_low == 1)
+    df["fractal_high"] = hm.notna().all(axis=1) & (df["high"] == max_high) & (count_high == 1)
     return df
 
 
@@ -128,7 +133,7 @@ class OKXTrader:
             raise RuntimeError(f"缺少环境变量: {', '.join(missing)}")
         if not FEISHU_WEBHOOK:
             print("⚠️ FEISHU_LIVE_WEBHOOK 未设置，不会推送飞书")
-        print(f"🔑 密钥已加载: API_KEY={API_KEY[:8]}***")
+        print("OKX credentials loaded")
 
         cfg = {
             "apiKey": API_KEY, "secret": API_SECRET, "password": PASSPHRASE,
@@ -138,7 +143,7 @@ class OKXTrader:
         # 本地需要代理才能连 OKX（有代理就用，没有就不加）
         if os.getenv("OKX_PROXY"):
             cfg["proxies"] = {"http": os.getenv("OKX_PROXY"), "https": os.getenv("OKX_PROXY")}
-            print("🌐 使用代理:", os.getenv("OKX_PROXY"))
+            print("OKX proxy configured")
         self.exchange = ccxt.okx(cfg)
         # 实盘不连 Sandbox
 
@@ -163,109 +168,90 @@ class OKXTrader:
             }
 
     def balance(self):
-        for attempt in range(2):
-            try:
-                bal = self.exchange.fetch_balance()
-                usdt = bal.get("USDT", {})
-                val = float(usdt.get("free", 0)) or float(usdt.get("total", 0))
-                if val > 0:
-                    return val
-            except Exception as e:
-                print(f"  余额查询第{attempt+1}次失败: {e}")
-                if attempt < 1:
-                    import time; time.sleep(2)
-        return 0
+        bal = self.exchange.fetch_balance()
+        val = float(bal.get("USDT", {}).get("free", 0))
+        if not math.isfinite(val) or val <= 0:
+            raise RuntimeError("Available USDT unknown or zero")
+        return val
 
     def position(self, name):
         sym = ASSETS[name]["symbol"]
-        try:
-            positions = self.exchange.fetch_positions([sym])
-            for p in positions:
-                if p.get("symbol") != sym:
-                    continue
-                # 只看逐仓(isolated)仓位，全仓(cross)仓位一律忽略
-                mmode = ((p.get("marginMode") or "").lower()
-                         or (p.get("info") or {}).get("mgnMode", "").lower())
-                if mmode != "isolated":
-                    continue
-                if abs(float(p.get("contracts", 0))) > 0:
-                    side = p.get("posSide", p.get("side", "long"))
-                    return {
-                        "side": side, "contracts": float(p["contracts"]),
-                        "entry": float(p.get("entryPrice", 0)),
-                    }
-            return None
-        except Exception as e:
-            print(f"  持仓查询失败 [{name}]: {e}")
-            return None
+        positions = self.exchange.fetch_positions([sym])
+        active = []
+        for p in positions:
+            if p.get("symbol") != sym:
+                continue
+            qty = abs(float(p.get("contracts", 0)))
+            if qty <= 0:
+                continue
+            mmode = ((p.get("marginMode") or "").lower()
+                     or (p.get("info") or {}).get("mgnMode", "").lower())
+            if mmode != "isolated":
+                raise RuntimeError(f"{name}: non-isolated or unknown position; manual review")
+            side = p.get("side") or (p.get("info") or {}).get("posSide")
+            if side not in ("long", "short"):
+                raise RuntimeError(f"{name}: unknown position side")
+            active.append({"side": side, "contracts": qty, "entry": float(p.get("entryPrice", 0))})
+        if len(active) > 1:
+            raise RuntimeError(f"{name}: multiple positions; manual review")
+        return active[0] if active else None
 
     def set_leverage(self, name, pos_side=None):
         sym = ASSETS[name]["symbol"]
-        market_data = self.exchange.market(sym)
-        inst_id = market_data["id"]
-        try:
-            params = {"instId": inst_id, "lever": str(LEVERAGE), "mgnMode": "isolated"}
-            if pos_side in ("long", "short"):
-                params["posSide"] = pos_side
-            self.exchange.set_leverage(LEVERAGE, sym, params=params)
-            print(f"  [{name}] 杠杆: {LEVERAGE}x (逐仓)")
-        except Exception as e:
-            print(f"  [{name}] 杠杆设置失败: {e}")
+        inst_id = self.exchange.market(sym)["id"]
+        params = {"instId": inst_id, "lever": str(LEVERAGE), "mgnMode": "isolated"}
+        if pos_side in ("long", "short"):
+            params["posSide"] = pos_side
+        result = self.exchange.set_leverage(LEVERAGE, sym, params=params)
+        data = result.get("data", []) if isinstance(result, dict) else []
+        if not data or not all(float(x.get("lever", 0)) == LEVERAGE for x in data):
+            raise RuntimeError("Leverage not positively confirmed")
+        return result
 
-    def open(self, name: str, signal: str, entry_price: float,
-             sl: float, tp: float, equity: float):
+    def open(self, name, signal, entry_price, sl, tp, equity, signal_time):
+        if os.getenv("OKX_LIVE_ENABLE") != "1":
+            raise RuntimeError("Live execution disabled")
+        if signal not in ("long", "short") or not all(math.isfinite(x) and x > 0 for x in (entry_price, sl, tp, equity)):
+            raise ValueError("Invalid order inputs")
+        if not (sl < entry_price < tp if signal == "long" else tp < entry_price < sl):
+            raise ValueError("Invalid stop/target geometry")
         sym = ASSETS[name]["symbol"]
         ct_val = self.contracts[name]["ct_val"]
         min_qty = self.contracts[name]["min_qty"]
-        pos_side = signal
-        order_side = "buy" if signal == "long" else "sell"
-
-        margin = equity * MARGIN_PCT
-        notional = margin * LEVERAGE
-        contracts = max(round(notional / (entry_price * ct_val), 2), min_qty)
-
-        market = self.exchange.market(sym)
-        inst_id = market["id"]
-
-        # 限价单价格：严格用信号入场价（避免市价滑点）
-        px = self.exchange.price_to_precision(sym, entry_price)
-
+        risk = abs(entry_price - sl) / entry_price
+        notional = min(equity * MARGIN_PCT * LEVERAGE, equity * RISK_PCT / (risk + COST_BUFFER))
+        qty = notional / (entry_price * ct_val)
+        contracts = float(self.exchange.amount_to_precision(sym, qty))
+        if not math.isfinite(contracts) or contracts < min_qty or contracts <= 0 or contracts > qty * (1 + 1e-10):
+            raise ValueError("Quantity cannot be sized safely")
+        inst_id = self.exchange.market(sym)["id"]
+        cid = ORDER_PREFIX + hashlib.sha256(f"{name}|{signal}|{signal_time}".encode()).hexdigest()[:24]
+        # Query by client ID first; only an explicit order-not-found code permits a new request.
+        try:
+            existing = self.exchange.private_get_trade_order({"instId": inst_id, "clOrdId": cid})
+        except ccxt.OrderNotFound:
+            existing = None
+        if existing is not None:
+            if str(existing.get("code")) != "51603":
+                raise RuntimeError("Prior signal order exists or lookup ambiguous; no submission")
         body = {
-            "instId": inst_id,
-            "tdMode": "isolated",
-            "side": order_side,
-            "posSide": pos_side,
-            "ordType": "limit",
-            "px": px,
+            "instId": inst_id, "tdMode": "isolated",
+            "side": "buy" if signal == "long" else "sell", "posSide": signal,
+            "ordType": "limit", "clOrdId": cid,
+            "px": self.exchange.price_to_precision(sym, entry_price),
             "sz": str(contracts),
             "attachAlgoOrds": [{
-                "tpTriggerPx": str(tp),
-                "tpOrdPx": "-1",
-                "slTriggerPx": str(sl),
-                "slOrdPx": "-1",
-                "sz": str(contracts),
-                "posSide": pos_side,
+                "tpTriggerPx": self.exchange.price_to_precision(sym, tp), "tpOrdPx": "-1",
+                "slTriggerPx": self.exchange.price_to_precision(sym, sl), "slOrdPx": "-1",
+                "sz": str(contracts), "posSide": signal,
             }],
         }
-        print(f"  [{name}] 挂限价单: {order_side} {contracts}张 @{px} posSide={pos_side}")
-        try:
-            order = self.exchange.private_post_trade_order(body)
-            print(f"  [{name}] ✅ 限价挂单成功 {order}")
-            return contracts, margin
-        except Exception as e:
-            print(f"  [{name}] 第1次下单失败: {e}")
-            body2 = dict(body)
-            del body2["posSide"]
-            for ao in body2["attachAlgoOrds"]:
-                ao.pop("posSide", None)
-            print(f"  [{name}] 重试(无posSide): {order_side} {contracts}张 @{px}")
-            try:
-                order = self.exchange.private_post_trade_order(body2)
-                print(f"  [{name}] ✅ 限价挂单成功 {order}")
-                return contracts, margin
-            except Exception as e2:
-                print(f"  [{name}] ❌ 重试也失败: {e2}")
-                raise e2
+        # Never retry an ambiguous submission; reconcile by clOrdId on subsequent scans.
+        result = self.exchange.private_post_trade_order(body)
+        data = result.get("data", []) if isinstance(result, dict) else []
+        if str(result.get("code")) != "0" or len(data) != 1 or str(data[0].get("sCode")) != "0" or not data[0].get("ordId"):
+            raise RuntimeError("Order acceptance not confirmed")
+        return contracts, contracts * entry_price * ct_val / LEVERAGE
 
     def fetch_ohlcv(self, name, tf, limit=100):
         sym = ASSETS[name]["symbol"]
@@ -287,55 +273,20 @@ class OKXTrader:
             return 0.0
 
     def fetch_open_orders(self, name):
-        """查询该币种未成交的普通限价挂单，返回 [{id, cTime(ms), price, side}]"""
-        market = self.exchange.market(ASSETS[name]["symbol"])
-        inst_id = market["id"]
+        sym = ASSETS[name]["symbol"]
+        orders = self.exchange.fetch_open_orders(sym)
         result = []
-        try:
-            orders = self.exchange.fetch_open_orders(ASSETS[name]["symbol"])
-            for o in orders:
-                info = o.get("info") or {}
-                if info.get("instId") != inst_id:
-                    continue
-                tm = (info.get("tdMode") or "").lower()
-                if tm and tm != "isolated":
-                    continue  # 只认逐仓挂单，忽略全仓
-                result.append({
-                    "id": o.get("id"),
-                    "cTime": int(info.get("cTime", 0) or 0),  # 创建时间(毫秒)
-                    "price": o.get("price"),
-                    "side": o.get("side"),
-                })
-        except Exception as e:
-            print(f"  查询挂单失败 [{name}]: {e}")
+        for o in orders:
+            info = o.get("info") or {}
+            if o.get("symbol") != sym and info.get("instId") != self.exchange.market(sym)["id"]:
+                raise RuntimeError("Unexpected order symbol")
+            result.append({"id": o.get("id"), "cTime": int(info.get("cTime", 0) or 0),
+                           "client_id": info.get("clOrdId") or o.get("clientOrderId") or "",
+                           "price": o.get("price"), "side": o.get("side")})
         return result
 
     def cancel_open_orders(self, name):
-        """撤销该币种所有未成交的普通限价挂单"""
-        sym = ASSETS[name]["symbol"]
-        market = self.exchange.market(sym)
-        inst_id = market["id"]
-        cancelled = 0
-        try:
-            orders = self.exchange.fetch_open_orders(sym)
-            for o in orders:
-                info = o.get("info") or {}
-                if info.get("instId") != inst_id:
-                    continue
-                tm = (info.get("tdMode") or "").lower()
-                if tm and tm != "isolated":
-                    continue  # 只撤逐仓挂单，忽略全仓
-                oid = o.get("id")
-                if not oid:
-                    continue
-                try:
-                    self.exchange.cancel_order(oid, sym)
-                    cancelled += 1
-                except Exception as e:
-                    print(f"    撤单失败 {oid}: {e}")
-        except Exception as e:
-            print(f"  撤销挂单失败 [{name}]: {e}")
-        return cancelled
+        raise RuntimeError("Bulk cancel disabled; reconcile owned order IDs manually")
 
     def get_algo_prices(self, name):
         """读取该币种挂单的止损/止盈价，返回 (sl, tp, algo_sz)"""
@@ -583,6 +534,9 @@ def detect_signal(name, m30_df, h1_df, h4_df, cfg):
 # ═══════════════════════════════════════════════════════════════
 
 def run_once():
+    if os.getenv("OKX_LIVE_ENABLE") != "1":
+        print("Live execution disabled; no exchange client created")
+        return
     ts = datetime.now(timezone.utc).strftime('%m-%d %H:%M')
     print(f"[{ts}] 🚀 实盘交易扫描...")
 
@@ -591,142 +545,45 @@ def run_once():
     except Exception as e:
         err = traceback.format_exc()
         print(f"[严重错误]\n{err}")
-        feishu(f"❌ 脚本崩溃 {ts}", f"```{err[:800]}```", color="red")
+        feishu("Execution blocked", "Scan failed; inspect local logs before resuming.", color="red")
+        raise
 
 
 def _run_inner(ts):
-    try:
-        trader = OKXTrader()
-    except Exception as e:
-        feishu("❌ OKX 初始化失败", f"```{traceback.format_exc()[:400]}```", "red")
-        return
-
+    trader = OKXTrader()
     equity = trader.balance()
-    print(f"账户余额: {equity:.2f} USDT")
-
-    btc_pos = trader.position("BTC")
-    eth_pos = trader.position("ETH")
-    btc_line = f"持仓 {btc_pos['side']} {btc_pos['contracts']}张 @{btc_pos['entry']}" if btc_pos else "无持仓"
-    eth_line = f"持仓 {eth_pos['side']} {eth_pos['contracts']}张 @{eth_pos['entry']}" if eth_pos else "无持仓"
-
-    signals_found = []
-
+    # Snapshot both symbols first. A failed private query aborts the entire round.
+    positions = {name: trader.position(name) for name in ASSETS}
+    orders = {name: trader.fetch_open_orders(name) for name in ASSETS}
+    # Existing exposure needs manual review: do not add or alter protection orders.
+    # Protection reconciliation and a durable order journal are mandatory before activation.
+    if any(positions.values()) or any(orders.values()):
+        feishu("Existing exposure: manual review", "New entries blocked while positions or orders exist.", "red")
+        return
     for name, cfg in ASSETS.items():
-        pos = trader.position(name)
-        if pos:
-            if not ADD_ENABLED:
-                print(f"  [{name}] 持仓 {pos['side']} {pos['contracts']}张 @{pos['entry']}（加仓已关闭，跳过）")
-                continue
-            # ── 持仓中：判断是否需要加仓（浮亏60%处）──
-            side = pos["side"]
-            entry = pos["entry"]
-            contracts = pos["contracts"]
-            sl, tp, algo_sz = trader.get_algo_prices(name)
-
-            if sl <= 0:
-                print(f"  [{name}] 持仓中但无止损单，跳过加仓")
-                continue
-
-            # 头仓应有张数（25%保证金×25x）
-            ct_val = trader.contracts[name]["ct_val"]
-            expected_head = equity * MARGIN_PCT * LEVERAGE / (entry * ct_val) if entry > 0 else 0
-
-            # 判断是否已加仓：挂单张数 > 1.25倍头仓（加仓3%后总张数≈1.6倍头仓）
-            ref_sz = algo_sz if algo_sz > 0 else contracts
-            if ref_sz > expected_head * 1.25:
-                print(f"  [{name}] 已加仓({contracts}张)，跳过")
-                continue
-
-            # 未加仓，计算加仓触发价（浮亏60%）
-            if side == "long":
-                add_price = entry - ADD_FRAC * (entry - sl)
-            else:
-                add_price = entry + ADD_FRAC * (sl - entry)
-
-            price = trader.fetch_price(name)
-            trigger = (side == "long" and price > 0 and price <= add_price) or \
-                      (side == "short" and price > 0 and price >= add_price)
-
-            if not trigger:
-                print(f"  [{name}] 持仓中，价格{price:.2f}未到加仓区(触发价{add_price:.2f})")
-                continue
-
-            # 触发加仓
-            print(f"  🔔 [{name}] 触及加仓区{add_price:.2f}，执行加仓!")
-            avg_entry = (entry + add_price) / 2
-            if side == "long":
-                new_risk = avg_entry - sl
-                new_tp = avg_entry + RR * new_risk
-            else:
-                new_risk = sl - avg_entry
-                new_tp = avg_entry - RR * new_risk
-
-            try:
-                add_contracts, add_margin, total = trader.add_to_position(
-                    name, side, add_price, sl, new_tp, contracts, equity)
-                signals_found.append(
-                    f"  📈 {side.upper()}加仓 @{add_price:.2f} | +{add_contracts}张 | 总{total}张"
-                )
-            except Exception as e:
-                feishu(f"⚠️ [{name}] 加仓失败", f"**错误**: `{str(e)[:300]}`", color="red")
-            continue
-
-        # 无持仓：先查挂单，判断是否超时（6根K线未成交才撤）
-        open_orders = trader.fetch_open_orders(name)
-        now_ms = int(time.time() * 1000)
-        if open_orders:
-            expired = [o for o in open_orders if now_ms - o["cTime"] > ORDER_TTL_MS]
-            if expired:
-                n_cancel = trader.cancel_open_orders(name)
-                print(f"  [{name}] 挂单超时(6根K线未成交)，撤销 {n_cancel} 个")
-            else:
-                age_min = (now_ms - open_orders[0]["cTime"]) / 60000
-                print(f"  [{name}] 已有挂单未成交(已挂{age_min:.0f}分钟)，保留等待成交")
-                continue
-
-        # 无挂单（或已撤销超时单）：拉数据 + 扫信号
-        try:
-            m30 = trader.fetch_ohlcv(name, "30m", 100)
-            h1 = trader.fetch_ohlcv(name, "1h", 50)
-            h4 = trader.fetch_ohlcv(name, "4h", 100)
-        except Exception as e:
-            print(f"  [{name}] 数据拉取失败: {e}")
-            continue
-
-        price = m30["close"].iloc[-1]
-        print(f"  [{name}] 价格: {price:.2f}")
-
+        m30 = trader.fetch_ohlcv(name, "30m", 100)
+        h1 = trader.fetch_ohlcv(name, "1h", 50)
+        h4 = trader.fetch_ohlcv(name, "4h", 100)
+        if m30.empty or h1.empty or h4.empty:
+            raise RuntimeError("Empty candles")
+        # Refuse stale, duplicate or unordered 30m bars.
+        stamps = m30["timestamp"]
+        if not stamps.is_monotonic_increasing or stamps.duplicated().any():
+            raise RuntimeError("Invalid candle sequence")
+        age = int(time.time() * 1000) - int(stamps.iloc[-1]) - 30 * 60 * 1000
+        if age < 0 or age >= 30 * 60 * 1000:
+            raise RuntimeError("Latest closed candle is missing or stale")
         sig = detect_signal(name, m30, h1, h4, cfg)
         if not sig:
-            print(f"  [{name}] 无信号")
             continue
-
-        print(f"  🔔 [{name}] {sig['signal'].upper()} 限价挂单 @{sig['entry']}")
+        # Refresh before submitting; any unexpected exposure blocks the entry.
+        if any(trader.position(n) for n in ASSETS) or any(trader.fetch_open_orders(n) for n in ASSETS):
+            raise RuntimeError("Exposure changed; abort")
         trader.set_leverage(name, sig["signal"])
-        try:
-            contracts, margin = trader.open(name, sig["signal"], sig["entry"],
-                                             sig["sl"], sig["tp"], equity)
-            signals_found.append(
-                f"  {sig['signal'].upper()} 限价挂单@{sig['entry']} | {contracts}张 | 保证金{margin:.2f}"
-            )
-        except Exception as e:
-            feishu(f"⚠️ [{name}] 挂单失败", f"**信号**: {sig['signal'].upper()} @{sig['entry']}\n**错误**: `{str(e)[:300]}`", color="red")
-
-    sig_text = "\n".join(signals_found) if signals_found else "本轮无信号"
-    action = "🎯 已下单！" if signals_found else "👀 等待信号"
-
-    feishu(
-        f"{action} {ts}",
-        f"**✅ 已连接 OKX 实盘**\n"
-        f"**账户余额**: {equity:.2f} USDT\n\n"
-        f"**BTC**: {btc_line} | **ETH**: {eth_line}\n\n"
-        f"**本轮信号**:\n{sig_text}",
-        color="red" if signals_found else "blue",
-    )
-
-    print(f"\n{'='*50}")
-    print(f"余额={equity:.2f} BTC={btc_line} ETH={eth_line} 信号={len(signals_found)}")
-    print("[Done]")
+        contracts, margin = trader.open(name, sig["signal"], sig["entry"], sig["sl"], sig["tp"], equity, sig["time"])
+        feishu("Order accepted", f"{name} {sig['signal']} {contracts} contracts; verify fill and protection.", "blue")
+        return  # one entry maximum per round
+    print("No eligible signal")
 
 
 if __name__ == "__main__":
